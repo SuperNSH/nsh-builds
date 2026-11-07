@@ -1,0 +1,225 @@
+name: Build
+
+# NSH publishes prebuilt distributions only for macOS arm64, Linux x86_64 and
+# Windows x86_64. This workflow fills in macOS x86_64, Linux arm64 and Windows
+# arm64 for every NSH release, and runs every 6 hours to catch new ones.
+#
+# Each build starts from NSH's own archive for the same OS and replaces only
+# what depends on the processor: the CLI, the desktop runtime and the GPUI
+# development host, all built from the release tag's source on a runner of
+# that architecture. Everything else (the web, iOS and Android runtimes and
+# the embedding SDKs) is NSH's own, unchanged.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "NSH release tag to build, e.g. v0.4.0 (default: NSH's latest release)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if the release already has every archive"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  UPSTREAM: longbridge/nsh
+
+jobs:
+  check:
+    name: check for a new NSH release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          tag="${INPUT_TAG:-$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)}"
+          have="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")' 2>/dev/null || true)"
+          build=false
+          for asset in nsh-macos-x86_64.tar.gz nsh-linux-arm64.tar.gz nsh-windows-arm64.zip; do
+            case " $have " in
+              *" $asset "*) ;;
+              *) build=true ;;
+            esac
+          done
+          [ "$FORCE" != true ] || build=true
+          echo "NSH $tag: build=$build (have: ${have:-nothing})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-x86_64, os: macos-15-intel, base: macos-arm64, desktop: macos, ext: tar.gz }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, base: linux-x86_64, desktop: linux, ext: tar.gz }
+          - { name: windows-arm64, os: windows-11-arm, base: windows-x86_64, desktop: windows, ext: zip }
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: longbridge/nsh
+          ref: ${{ needs.check.outputs.tag }}
+          path: nsh-src
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-dir: ${{ runner.temp }}/kache
+          manifest-key: build-${{ matrix.name }}
+          cache-key-prefix: kache-build-${{ matrix.name }}
+          save-cache: ${{ github.ref == 'refs/heads/master' }}
+          pr-comment: false
+
+      # The same packages as NSH's release workflow, without Android's.
+      - name: Install clang, GTK 4 and GPUI's libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libclang-dev libgtk-4-dev libwebkitgtk-6.0-dev \
+            libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Set up Windows
+        if: runner.os == 'Windows'
+        run: |
+          # QuickJS is C: bindgen needs an arm64 libclang.
+          if [ -f "C:/Program Files/LLVM/bin/libclang.dll" ]; then
+            echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+          else
+            echo "::error::no LLVM at C:/Program Files/LLVM on this runner"
+            exit 1
+          fi
+          # rustc can overflow its default stack on the `windows` crate.
+          echo "RUST_MIN_STACK=268435456" >> "$GITHUB_ENV"
+
+      - name: Build the CLI and the desktop runtime
+        working-directory: nsh-src
+        run: cargo build --release -p nsh-cli -p nsh-${{ matrix.desktop }}-host -p nsh-${{ matrix.desktop }}-app
+
+      - name: Build the GPUI development host
+        working-directory: nsh-src
+        run: cargo build --release --manifest-path crates/gpui/Cargo.toml --target-dir target -p nsh-gpui-host
+
+      - name: Assemble the distribution from NSH's own archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base="nsh-${{ matrix.base }}.${{ matrix.ext }}"
+          work="$RUNNER_TEMP/work"
+          mkdir -p "$work"
+          gh release download "$TAG" --repo "$UPSTREAM" --pattern "$base" --pattern "$base.sha256" --dir "$work"
+          (cd "$work" && if command -v sha256sum > /dev/null; then sha256sum -c "$base.sha256"; else shasum -a 256 -c "$base.sha256"; fi)
+          if [ "${{ matrix.ext }}" = zip ]; then
+            7z x -o"$work" "$work/$base" > /dev/null
+          else
+            tar -xzf "$work/$base" -C "$work"
+          fi
+          dist="$work/nsh"
+          exe=""
+          [ "$RUNNER_OS" != Windows ] || exe=".exe"
+          release=nsh-src/target/release
+          cp "$release/nsh$exe" "$dist/bin/nsh$exe"
+          rm -rf "$dist/runtime/${{ matrix.desktop }}" "$dist/runtime/gpui"
+          mkdir -p "$dist/runtime/${{ matrix.desktop }}" "$dist/runtime/gpui"
+          for package in nsh-${{ matrix.desktop }}-host nsh-${{ matrix.desktop }}-app; do
+            cp "$release/$package$exe" "$dist/runtime/${{ matrix.desktop }}/$package$exe"
+          done
+          cp "$release/nsh-gpui-host$exe" "$dist/runtime/gpui/nsh-gpui-host$exe"
+          echo "DIST=$dist" >> "$GITHUB_ENV"
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+          file "$dist/bin/nsh$exe" "$dist"/runtime/${{ matrix.desktop }}/* "$dist"/runtime/gpui/* || true
+
+      # The CLI makes a new app, bundles it and packages it with the runtime built here.
+      - name: Smoke test
+        run: |
+          nsh="$DIST/bin/nsh$EXE"
+          "$nsh" --version
+          app="$RUNNER_TEMP/smoke-app"
+          "$nsh" init "$app"
+          "$nsh" build "$app" -o "$RUNNER_TEMP/smoke-out" --release
+          "$nsh" package "$app" --target ${{ matrix.desktop }} --out "$RUNNER_TEMP/smoke-package"
+          ls -la "$RUNNER_TEMP/smoke-package"
+
+      - name: Package
+        run: |
+          mkdir -p assets
+          archive="nsh-${{ matrix.name }}.${{ matrix.ext }}"
+          cd "$(dirname "$DIST")"
+          if [ "${{ matrix.ext }}" = zip ]; then
+            7z a -tzip "$GITHUB_WORKSPACE/assets/$archive" nsh > /dev/null
+          else
+            tar -czf "$GITHUB_WORKSPACE/assets/$archive" nsh
+          fi
+          cd "$GITHUB_WORKSPACE/assets"
+          if command -v sha256sum > /dev/null; then sha256sum "$archive"; else shasum -a 256 "$archive"; fi > "$archive.sha256"
+          ls -l
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nsh-${{ matrix.name }}
+          path: assets/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh install.ps1 assets/
+          ls -l assets
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "NSH $TAG" \
+              --notes "NSH $TAG for macOS x86_64, Linux arm64 and Windows arm64, built from https://github.com/$UPSTREAM/releases/tag/$TAG. The other platforms are NSH's own release."
+          fi
