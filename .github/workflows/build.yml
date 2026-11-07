@@ -51,7 +51,10 @@ jobs:
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       build: ${{ steps.check.outputs.build }}
+      matrix: ${{ steps.check.outputs.matrix }}
     steps:
+      # Only the platforms the release does not have yet are built, so a run
+      # that failed on one platform does not rebuild the others.
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,17 +63,22 @@ jobs:
         run: |
           tag="${INPUT_TAG:-$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)}"
           have="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")' 2>/dev/null || true)"
-          build=false
-          for asset in nsh-macos-x86_64.tar.gz nsh-linux-arm64.tar.gz nsh-windows-arm64.zip; do
-            case " $have " in
-              *" $asset "*) ;;
-              *) build=true ;;
-            esac
-          done
-          [ "$FORCE" != true ] || build=true
-          echo "NSH $tag: build=$build (have: ${have:-nothing})"
+          all='[
+            {"name": "macos-x86_64", "os": "macos-15-intel", "base": "macos-arm64", "desktop": "macos", "ext": "tar.gz"},
+            {"name": "linux-arm64", "os": "ubuntu-24.04-arm", "base": "linux-x86_64", "desktop": "linux", "ext": "tar.gz"},
+            {"name": "windows-arm64", "os": "windows-11-arm", "base": "windows-x86_64", "desktop": "windows", "ext": "zip"}
+          ]'
+          if [ "$FORCE" = true ]; then
+            matrix="$(jq -c . <<< "$all")"
+          else
+            matrix="$(jq -c --arg have " $have " '[.[] | select(. as $p | $have | contains(" nsh-\($p.name).\($p.ext) ") | not)]' <<< "$all")"
+          fi
+          build=true
+          [ "$matrix" != "[]" ] || build=false
+          echo "NSH $tag: building $matrix (have: ${have:-nothing})"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.name }})
@@ -81,10 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: macos-x86_64, os: macos-15-intel, base: macos-arm64, desktop: macos, ext: tar.gz }
-          - { name: linux-arm64, os: ubuntu-24.04-arm, base: linux-x86_64, desktop: linux, ext: tar.gz }
-          - { name: windows-arm64, os: windows-11-arm, base: windows-x86_64, desktop: windows, ext: zip }
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
     env:
       TAG: ${{ needs.check.outputs.tag }}
     steps:
@@ -128,9 +133,24 @@ jobs:
           # rustc can overflow its default stack on the `windows` crate.
           echo "RUST_MIN_STACK=268435456" >> "$GITHUB_ENV"
 
+      # NSH's release profile uses fat LTO with one codegen unit: linking several
+      # binaries at once ran the 16 GB Arm runner out of memory, so add swap and
+      # build them one at a time.
+      - name: Add swap
+        if: runner.os == 'Linux'
+        run: |
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build
+          sudo swapon /swapfile-build
+          free -h
+
       - name: Build the CLI and the desktop runtime
         working-directory: nsh-src
-        run: cargo build --release -p nsh-cli -p nsh-${{ matrix.desktop }}-host -p nsh-${{ matrix.desktop }}-app
+        run: |
+          for package in nsh-cli nsh-${{ matrix.desktop }}-host nsh-${{ matrix.desktop }}-app; do
+            cargo build --release -p "$package"
+          done
 
       - name: Build the GPUI development host
         working-directory: nsh-src
@@ -198,6 +218,8 @@ jobs:
   release:
     name: publish
     needs: [check, build]
+    # Publish whatever built, even if another platform failed.
+    if: ${{ !cancelled() && needs.check.outputs.build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -214,6 +236,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          ls assets/nsh-* > /dev/null 2>&1 || { echo "::error::no platform built"; exit 1; }
           cp install.sh install.ps1 assets/
           ls -l assets
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
